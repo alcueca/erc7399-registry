@@ -163,8 +163,9 @@ contract Registry {
         ) = abi.decode(outerData, (
             bytes,
             address, 
-            function(address, IERC20, uint256, uint256, bytes memory) external returns (bytes memory)));
-        return callbackReceiver.innerCallback(loanReceiver, asset, amount, fee, innerData);
+            callbackReceiver.innerCallback(address, IERC20, uint256, uint256, bytes)
+        ));
+        return innerCallback(loanReceiver, asset, amount, fee, innerData);
 
     }
 }
