@@ -1,22 +1,62 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity >=0.8.19;
 
+import "./ERC20.sol";
+
+interface IERC3156PPLender {
+
+    /// @dev Flash borrow using the ERC3156++ flash loan standard.
+    function flashLoan(
+        address loanReceiver,
+        address callbackReceiver,
+        address asset,
+        uint256 amount,
+        bytes calldata data,
+        /// @dev callback
+        /// @param callbackReceiver The contract receiving the callback
+        /// @param loanReceiver The address receiving the flash loan
+        /// @param asset The asset to be loaned
+        /// @param amount The amount to loaned
+        /// @param data The ABI encoded data to be passed to the callback
+        /// @return result ABI encoded result of the callback
+        function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
+    ) external returns (bytes memory);
+}
+
+/// @dev The forwarder is deployed by the registry to verify that the loan can be sent to a contract
+/// different from the one that receives the callback
+contract Forwarder {
+    address public immutable owner;
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function retrieve(ERC20 asset, uint256 amount) external {
+        require(msg.sender == owner, "Unauthorized");
+        asset.transfer(owner, amount);
+    }
+}
+
 contract Registry {
     struct Lender {
         // TODO: Pack to save gas on registration
-        address lender; // The address of the lender
-        address asset;  // The address of the asset
-        uint256 amount; // The amount of the asset lent on registration, in asset units and capped at 2**88-1
-        uint256 fee;    // The fee paid to the lender on registration, in percentage of the loan amount
-        uint256 gas;    // The gas used on registration
+        IERC3156PPLender lender; // The address of the lender
+        ERC20 asset;             // The address of the asset
+        uint256 amount;          // The amount of the asset lent on registration, in asset units and capped at 2**88-1
+        uint256 fee;             // The fee paid to the lender on registration, in percentage of the loan amount
+        uint256 gas;             // The gas used on registration
     }
 
+    Forwarder public immutable forwarder; // The forwarder contract
     bool public safe;   // Whether a callback is authorized
 
     Lender[] public lenders; // The list of registered lenders
-    mapping(address lender => mapping(address asset => uint256)) public lenderIndex; // The index of the lender in the list of registered lenders
-    mapping(address asset => uint256[3]) public topLenders; // The top lenders for each asset
+    mapping(IERC3156PPLender lender => mapping(ERC20 asset => uint256)) public lenderIndex; // The index of the lender in the list of registered lenders
+    mapping(ERC20 asset => uint256[3]) public topLenders; // The top lenders for each asset
 
+    constructor() {
+        forwarder = new Forwarder();
+    }
 
     /// ------------------------------------------------------------------------------------------------------------------------ ///
     /// ------------------------------------------------------- REGISTRY ------------------------------------------------------- ///
@@ -30,29 +70,29 @@ contract Registry {
     /// @param lender The address of the lender to be registered.
     /// @param asset The address of the asset to be registered.
     /// @param amount The amount of the asset to be registered.
-    function register(address lender, address asset, uint256 amount) external returns (uint256 ranking) {
+    function register(IERC3156PPLender lender, ERC20 asset, uint256 amount) external returns (uint256) {
         safe = true;
-        rank = abi.decode(uint256, lender.flashLoan(
+        uint256 rank = abi.decode(uint256, lender.flashLoan(
             forwarder,
             address(this),
             asset,
             amount,
-            abi.encode(gasLeft()),
-            this.registerCallback(address, IERC20, uint256, uint256, bytes)
+            abi.encode(gasleft()),
+            this.registerCallback(address, ERC20, uint256, uint256, bytes)
         ));
         delete safe;
         return rank;
     }
 
-    function registerCallback(address loanReceiver, IERC20 asset, uint256 amount, uint256 fee, bytes memory data) external returns (bytes memory) {
-        uint256 gasAtCallback = gasLeft();
+    function registerCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory data) external returns (bytes memory) {
+        uint256 gasAtCallback = gasleft();
         require(safe, "Unauthorized callback");
-        delete safe;
 
         require(asset.balanceOf(loanReceiver) >= amount, "Loan not received");
         loanReceiver.retrieve(asset, amount);
         asset.approve(msg.sender, amount);
 
+        IERC3156PPLender lender = IERC3156PPLender(msg.sender);
         (uint256 gasAtCall) = abi.decode(data, (uint256));
         Lender memory newLender = Lender(
             lender,
@@ -64,44 +104,44 @@ contract Registry {
 
         // If this is the first time the lender is registered for the given asset, add it to the list of lenders
         // If not, update the lender entry only if amount is bigger or equal and fee/amount is lower
-        uint256 lenderIndex_ = lenderIndex[lender][asset];
-        if (newLenderIndex == 0) {
-            newLenderIndex = lenders.length;
+        uint256 index = lenderIndex[lender][asset];
+        if (index == 0) {
+            index = lenders.length;
             lenders.push(newLender);
-            lenderIndex[lender_][asset] = newLenderIndex;
+            lenderIndex[lender][asset] = index;
         } else {
-            Lender memory oldLender = lenders[newLenderIndex];
-            if (newLender.amount >= oldLender.amount && newLender.fee < oldLender.fee) {
-                lenders[newLenderIndex] = newLender;
+            Lender memory storedLender = lenders[index];
+            if (newLender.amount >= storedLender.amount && newLender.fee <= storedLender.fee) {
+                lenders[index] = newLender;
             }
         }
 
         // Update the top lenders for the given asset
-        return abi.encode(_rank(newLender, newLenderIndex));
+        return abi.encode(_rank(newLender, index));
     }
 
     /// @dev Return the rank of the lender for the given asset, and update the top lenders if needed.
-    function _rank(Lender memory newLender, uint256 newLenderIndex) internal returns (uint256 rank) {
-        uint256[3] memory topLenders_ = topLenders[lender.asset];
+    function _rank(Lender memory newLender, uint256 index) internal returns (uint256 rank) {
+        uint256[3] memory topLenders_ = topLenders[newLender.asset];
 
         Lender memory firstLender = lenders[topLenders_[0]];
         if (newLender.amount >= firstLender.amount && newLender.fee < firstLender.fee) {
             topLenders_[2] = topLenders_[1];
             topLenders_[1] = topLenders_[0];
-            topLenders_[0] = newLenderIndex;
+            topLenders_[0] = index;
             return 0;
         }
 
         Lender memory secondLender = lenders[topLenders_[1]];
         if (newLender.amount >= secondLender.amount && newLender.fee < secondLender.fee) {
             topLenders_[2] = topLenders_[1];
-            topLenders_[1] = newLenderIndex;
+            topLenders_[1] = index;
             return 1;
         }
 
         Lender memory thirdLender = lenders[topLenders_[2]];
         if (newLender.amount >= thirdLender.amount && newLender.fee < thirdLender.fee) {
-            topLenders_[2] = newLenderIndex;
+            topLenders_[2] = index;
             return 2;
         }
 
@@ -139,31 +179,50 @@ contract Registry {
         /// @param amount The amount to loaned
         /// @param data The ABI encoded data to be passed to the callback
         /// @return result ABI encoded result of the callback
-        function(address, IERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
+        function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
     ) external returns (bytes memory) {
+        require(!safe, "No reentrancy");
         safe = true;
-        return lenders[topLenders[0]].lender.flashLoan(
+
+        Lender storage storedLender = lenders[topLenders[0]];
+        require(storedLender.lender != address(0), "No lender registered");
+        (uint256 storedAmount, uint256 storedFee) = (storedLender.amount, storedLender.fee);
+
+        // If the flash loan is more significant than the registered one, we update it
+        if (amount >= storedAmount) {
+            uint256 fee = storedLender.lender.flashFee(asset, amount); // We only do this call if it is the largest flash loan for this lender and asset
+            if (fee * 1e18 / amount <= storedFee) {
+                (storedLender.amount, storedLender.fee) = (amount, fee * 1e18 / amount);
+                // We can't measure gas, so we just assume it is the same as it was
+            }
+        }
+
+        // The big problem here is that a malicious lender could serve zero fees to this contract, and then charge a fee to other users routed through here.
+        // This malicious lender could use flash loans itself and even accept a loss, just so that no honest lender can kick him from the top spot.
+
+        bytes memory result = storedLender.lender.flashLoan(
             loanReceiver,
             address(this),
             asset,
             amount,
             abi.encode(data, callbackReceiver, callback),
-            this.forwardCallback(address, IERC20, uint256, uint256, bytes) // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
+            this.forwardCallback(address, ERC20, uint256, uint256, bytes) // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
         );
+        delete safe;
+        return result;
     }
 
     /// @dev Forward the callback to the callback receiver, acting as a trusted forwarder.
-    function forwardCallback(address loanReceiver, IERC20 asset, uint256 amount, uint256 fee, bytes memory outerData) external returns (bytes memory) {
+    function forwardCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory outerData) external returns (bytes memory) {
         require(safe, "Unauthorized callback");
-        delete safe;
         (
             bytes memory innerData,
             address callbackReceiver,
-            function(address, IERC20, uint256, uint256, bytes memory) external returns (bytes memory) innerCallback
+            function(address, ERC20, uint256, uint256, bytes memory) external returns (bytes memory) innerCallback
         ) = abi.decode(outerData, (
             bytes,
             address, 
-            callbackReceiver.innerCallback(address, IERC20, uint256, uint256, bytes)
+            function(address, ERC20, uint256, uint256, bytes)
         ));
         return innerCallback(loanReceiver, asset, amount, fee, innerData);
 
