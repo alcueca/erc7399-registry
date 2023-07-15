@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity >=0.8.19;
 
-import { ERC20 } from "lib/solmate/src/token/ERC20.sol";
+import { ERC20 } from "lib/solmate/src/tokens/ERC20.sol";
 import { Owned } from "lib/solmate/src/auth/Owned.sol";
 
-interface IERC3156PPLender is Owned {
+interface IERC3156PPLender {
 
-    /// @dev Flash borrow using the ERC3156++ flash loan standard.
+    /**
+     * @dev Initiate a flash loan.
+     * @param loanReceiver The receiver of the tokens in the loan
+     * @param callbackReceiver The receiver of the callback.
+     * @param asset The loan currency.
+     * @param amount The amount of tokens lent.
+     * @param data Arbitrary data structure, intended to contain user-defined parameters.
+     * @param callback The function to call on the callback receiver.
+     * @return The returned data by the receiver of the flash loan.
+     */
     function flashLoan(
         address loanReceiver,
         address callbackReceiver,
-        address asset,
+        ERC20 asset,
         uint256 amount,
         bytes calldata data,
         /// @dev callback
@@ -22,6 +31,21 @@ interface IERC3156PPLender is Owned {
         /// @return result ABI encoded result of the callback
         function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
     ) external returns (bytes memory);
+
+    /**
+     * @dev The amount of currency available to be lended.
+     * @param token The loan currency.
+     * @return The amount of `token` that can be borrowed.
+     */
+    function maxFlashLoan(address token) external view returns (uint256);
+
+    /**
+     * @dev The fee to be charged for a given loan.
+     * @param token The loan currency.
+     * @param amount The amount of tokens lent.
+     * @return The amount of `token` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(address token, uint256 amount) external view returns (uint256);
 }
 
 library Cast {
@@ -47,6 +71,8 @@ contract Forwarder {
 }
 
 contract Registry is Owned {
+    using Cast for uint256;
+
     event Requested(IERC3156PPLender lender, ERC20 asset);
     event Unrequested(IERC3156PPLender lender, ERC20 asset);
     event Registered(IERC3156PPLender lender, ERC20 asset, uint256 rank);
@@ -67,8 +93,9 @@ contract Registry is Owned {
     Lender[] public lenders; // The list of registered lenders
     mapping(IERC3156PPLender lender => mapping(ERC20 asset => uint256)) public lenderIndex; // The index of the lender in the list of registered lenders
     mapping(ERC20 asset => uint256[3]) public topLenders; // The top lenders for each asset
+    mapping(bytes32 => uint256) public requests; // The list of requests to register a lender for a given asset
 
-    constructor() Owned() {
+    constructor(address owner) Owned(owner) {
         // The forwarder is deployed by the registry to verify that the loan can be sent to a contract different from the one receiving the callback.
         forwarder = new Forwarder();
 
@@ -121,14 +148,17 @@ contract Registry is Owned {
         delete requests[requestHash];
 
         registerCallbackLock = true;
-        uint256 rank = abi.decode(uint256, lender.flashLoan(
-            forwarder,
-            address(this),
-            asset,
-            amount,
-            abi.encode(gasleft()),
-            this.registerCallback(address, ERC20, uint256, uint256, bytes)
-        ));
+        uint256 rank = abi.decode(
+            lender.flashLoan(
+                address(forwarder),
+                address(this),
+                asset,
+                amount,
+                abi.encode(gasleft()),
+                this.registerCallback(address, ERC20, uint256, uint256, bytes)
+            ),
+            (uint256)
+        );
         delete registerCallbackLock;
 
         emit Registered(lender, asset, rank);
@@ -141,7 +171,7 @@ contract Registry is Owned {
         require(registerCallbackLock, "Unauthorized callback");
 
         require(asset.balanceOf(loanReceiver) >= amount, "Loan not received");
-        loanReceiver.retrieve(asset, amount);
+        Forwarder(loanReceiver).retrieve(asset, amount);
         asset.approve(msg.sender, amount);
 
         IERC3156PPLender lender = IERC3156PPLender(msg.sender);
@@ -226,7 +256,7 @@ contract Registry is Owned {
     }
 
     /// @dev Return the top three lenders for an asset, in a gas efficient way.
-    function topLendersPacked(address asset) external view returns (bytes memory) {
+    function topLendersPacked(ERC20 asset) external view returns (bytes memory) {
         uint256[3] memory topLenders_ = topLenders[asset];
         Lender memory firstLender = lenders[topLenders_[0]];
         Lender memory secondLender = lenders[topLenders_[1]];
@@ -246,7 +276,7 @@ contract Registry is Owned {
     function flashLoan(
         address loanReceiver,
         address callbackReceiver,
-        address asset,
+        ERC20 asset,
         uint256 amount,
         bytes calldata data,
         /// @dev callback
@@ -261,15 +291,15 @@ contract Registry is Owned {
         require(!forwardCallbackLock, "No reentrancy");
         forwardCallbackLock = true;
 
-        Lender storage storedLender = lenders[topLenders[0]];
-        require(storedLender.lender != address(0), "No lender registered");
+        Lender storage storedLender = lenders[topLenders[asset][0]];
+        require(address(storedLender.lender) != address(0), "No lender registered");
         (uint256 storedAmount, uint256 storedFee) = (storedLender.amount, storedLender.fee);
 
         // If the flash loan is more significant than the registered one, we update it
         if (amount >= storedAmount) {
             uint256 fee = storedLender.lender.flashFee(asset, amount); // We only do this call if it is the largest flash loan for this lender and asset
             if (fee * 1e18 / amount <= storedFee) {
-                (storedLender.amount, storedLender.fee) = (amount, fee * 1e18 / amount);
+                (storedLender.amount, storedLender.fee) = (amount.u88(), (fee * 1e18 / amount).u88());
                 // We can't measure gas, so we just assume it is the same as it was
             }
         }
