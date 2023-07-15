@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity >=0.8.19;
 
-import "./ERC20.sol";
+import { ERC20 } from "lib/solmate/src/token/ERC20.sol";
+import { Owned } from "lib/solmate/src/auth/Owned.sol";
 
-interface IERC3156PPLender {
+interface IERC3156PPLender is Owned {
 
     /// @dev Flash borrow using the ERC3156++ flash loan standard.
     function flashLoan(
@@ -37,7 +38,7 @@ contract Forwarder {
     }
 }
 
-contract Registry {
+contract Registry is Owned {
     struct Lender {
         // TODO: Pack to save gas on registration
         IERC3156PPLender lender; // The address of the lender
@@ -54,8 +55,19 @@ contract Registry {
     mapping(IERC3156PPLender lender => mapping(ERC20 asset => uint256)) public lenderIndex; // The index of the lender in the list of registered lenders
     mapping(ERC20 asset => uint256[3]) public topLenders; // The top lenders for each asset
 
-    constructor() {
+    constructor() Owned() {
         forwarder = new Forwarder();
+
+        // We add a dummy lender at index 0 so that the lenderIndex returning zero is interpreted as "not registered"
+        lenders.push(
+            Lender(
+                IERC3156PPLender(address(0)),
+                ERC20(address(0)),
+                type(uint256).max,
+                0,
+                0
+            )
+        );
     }
 
     /// ------------------------------------------------------------------------------------------------------------------------ ///
@@ -70,7 +82,7 @@ contract Registry {
     /// @param lender The address of the lender to be registered.
     /// @param asset The address of the asset to be registered.
     /// @param amount The amount of the asset to be registered.
-    function register(IERC3156PPLender lender, ERC20 asset, uint256 amount) external returns (uint256) {
+    function register(IERC3156PPLender lender, ERC20 asset, uint256 amount) onlyOwner external returns (uint256) {
         safe = true;
         uint256 rank = abi.decode(uint256, lender.flashLoan(
             forwarder,
@@ -118,6 +130,29 @@ contract Registry {
 
         // Update the top lenders for the given asset
         return abi.encode(_rank(newLender, index));
+    }
+
+    /// @dev Unregister an ERC3156++ flash loan lender for a given asset.
+    function unregister(IERC3156PPLender lender, ERC20 asset) onlyOwner external {
+        uint256 index = lenderIndex[lender][asset];
+        require(index != 0, "Lender not registered");
+        delete lenderIndex[lender][asset];
+        delete lenders[index];
+
+        uint256[3] memory topLenders_ = topLenders[asset];
+        if (topLenders_[0] == index) {
+            topLenders_[0] = topLenders_[1];
+            topLenders_[1] = topLenders_[2];
+            topLenders_[2] = 0;
+        }
+        if (topLenders_[1] == index) {
+            topLenders_[1] = topLenders_[2];
+            topLenders_[2] = 0;
+        }
+        if (topLenders_[2] == index) {
+            topLenders_[2] = 0;
+        }
+        topLenders[asset] = topLenders_;
     }
 
     /// @dev Return the rank of the lender for the given asset, and update the top lenders if needed.
@@ -197,8 +232,8 @@ contract Registry {
             }
         }
 
-        // The big problem here is that a malicious lender could serve zero fees to this contract, and then charge a fee to other users routed through here.
-        // This malicious lender could use flash loans itself and even accept a loss, just so that no honest lender can kick him from the top spot.
+        // A malicious lender could serve zero fees to this contract, and then charge a fee to other users routed through here.
+        // This contract has governance only to keep such malicious lenders out. If a lender is registered, it is assumed to be trusted.
 
         bytes memory result = storedLender.lender.flashLoan(
             loanReceiver,
