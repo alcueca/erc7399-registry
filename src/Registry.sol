@@ -28,7 +28,7 @@ interface IERC3156PP {
         /// @param amount The amount to loaned
         /// @param data The ABI encoded data to be passed to the callback
         /// @return result ABI encoded result of the callback
-        function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
+        function(address, ERC20, uint256, uint256, bytes memory) external returns (bytes memory) callback
     ) external returns (bytes memory);
 
     /**
@@ -52,7 +52,26 @@ interface Chooser {
     function choose(IERC3156PP[3] calldata, ERC20 asset, uint256 amount, bytes memory data) external returns (IERC3156PP);
 }
 
+library RevertMsgExtractor {
+    /// @dev Helper function to extract a useful revert message from a failed call.
+    /// If the returned data is malformed or not correctly abi encoded then this call can fail itself.
+    function getRevertMsg(bytes memory returnData)
+        internal pure
+        returns (string memory)
+    {
+        // If the _res length is less than 68, then the transaction failed silently (without a revert message)
+        if (returnData.length < 68) return "Transaction reverted silently";
+
+        assembly {
+            // Slice the sighash.
+            returnData := add(returnData, 0x04)
+        }
+        return abi.decode(returnData, (string)); // All that remains is the revert string
+    }
+}
+
 contract Registry is Chooser {
+    using RevertMsgExtractor for bytes;
 
     event FlashLoan(ERC20 indexed asset, uint256 amount, uint256 fee);
     event Set(address indexed user, ERC20 indexed asset, IERC3156PP[3] lenders, Chooser chooser);
@@ -76,6 +95,7 @@ contract Registry is Chooser {
     }
 
     /// @dev Return the lender that can service the loan for the lowest fee.
+    /// This is a default Chooser, but users can implement their own.
     function choose(IERC3156PP[3] calldata lenders, ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best) {
         return _choose(lenders, asset, amount, data);
     }
@@ -108,7 +128,7 @@ contract Registry is Chooser {
         /// @param amount The amount to loaned
         /// @param data The ABI encoded data to be passed to the callback
         /// @return result ABI encoded result of the callback
-        function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
+        function(address, ERC20, uint256, uint256, bytes memory) external returns (bytes memory) callback
     ) external returns (bytes memory) {
         require(!inFlashLoan, "No reentrancy");
         inFlashLoan = true;
@@ -130,8 +150,8 @@ contract Registry is Chooser {
             address(this),
             asset,
             amount,
-            abi.encode(data, callbackReceiver, callback),
-            this.forwardCallback(address, ERC20, uint256, uint256, bytes) // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
+            abi.encode(data, callbackReceiver, callback.selector),
+            this.forwardCallback // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
         );
         inFlashLoan = false;
         return result;
@@ -140,17 +160,22 @@ contract Registry is Chooser {
     /// @dev Forward the callback to the callback receiver, acting as a trusted forwarder.
     function forwardCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory outerData) external returns (bytes memory) {
         require(inFlashLoan, "Unauthorized callback");
-        (
-            bytes memory innerData,
-            address callbackReceiver,
-            function(address, ERC20, uint256, uint256, bytes memory) external returns (bytes memory) innerCallback
-        ) = abi.decode(outerData, (
-            bytes,
-            address, 
-            bytes // function(address, ERC20, uint256, uint256, bytes)
-        ));
+        (bytes memory innerData, address callbackReceiver, bytes4 callbackSelector) = abi.decode(outerData, (bytes, address, bytes4));
 
         emit FlashLoan(asset, amount, fee);
-        return innerCallback(loanReceiver, asset, amount, fee, innerData);
+        (bool success, bytes memory result) = callbackReceiver.call(
+            abi.encodeWithSelector(
+                callbackSelector,
+                msg.sender,
+                loanReceiver,
+                asset,
+                amount,
+                innerData
+            )
+        );
+
+        require(success, result.getRevertMsg());
+
+        return result;
     }
 }
