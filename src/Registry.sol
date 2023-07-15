@@ -60,14 +60,16 @@ contract Registry is Owned {
         uint88 gas;              // The gas used on registration
     }
 
+    bool public forwardCallbackLock;     // forwardCallback can only be called while executing a flash loan
+    bool public registerCallbackLock;    // registerCallback can only be called while registering a flash loan
     Forwarder public immutable forwarder; // The forwarder contract
-    bool public safe;   // Whether a callback is authorized
 
     Lender[] public lenders; // The list of registered lenders
     mapping(IERC3156PPLender lender => mapping(ERC20 asset => uint256)) public lenderIndex; // The index of the lender in the list of registered lenders
     mapping(ERC20 asset => uint256[3]) public topLenders; // The top lenders for each asset
 
     constructor() Owned() {
+        // The forwarder is deployed by the registry to verify that the loan can be sent to a contract different from the one receiving the callback.
         forwarder = new Forwarder();
 
         // We add a dummy lender at index 0 so that the lenderIndex returning zero is interpreted as "not registered"
@@ -88,6 +90,7 @@ contract Registry is Owned {
 
     /// @dev Anyone can request a lender to be registered for a given asset. There is a delay of 7 days.
     function request(IERC3156PPLender lender, ERC20 asset) external {
+        require(lenderIndex[lender][asset] == 0, "Lender already registered");
         bytes32 requestHash = keccak256(abi.encode(lender,asset));
         require(requests[requestHash] == 0, "Request already made");
         requests[requestHash] = block.timestamp + 7 days;
@@ -117,7 +120,7 @@ contract Registry is Owned {
         require(requests[requestHash] > block.timestamp, "Request not ready");
         delete requests[requestHash];
 
-        safe = true;
+        registerCallbackLock = true;
         uint256 rank = abi.decode(uint256, lender.flashLoan(
             forwarder,
             address(this),
@@ -126,15 +129,16 @@ contract Registry is Owned {
             abi.encode(gasleft()),
             this.registerCallback(address, ERC20, uint256, uint256, bytes)
         ));
-        delete safe;
+        delete registerCallbackLock;
 
         emit Registered(lender, asset, rank);
         return rank;
     }
 
+    /// @dev Receive a callback from a flash loan, intended to register a new lender.
     function registerCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory data) external returns (bytes memory) {
         uint256 gasAtCallback = gasleft();
-        require(safe, "Unauthorized callback");
+        require(registerCallbackLock, "Unauthorized callback");
 
         require(asset.balanceOf(loanReceiver) >= amount, "Loan not received");
         loanReceiver.retrieve(asset, amount);
@@ -254,8 +258,8 @@ contract Registry is Owned {
         /// @return result ABI encoded result of the callback
         function(address, ERC20, uint256, uint256, bytes memory, address) external returns (bytes memory) callback
     ) external returns (bytes memory) {
-        require(!safe, "No reentrancy");
-        safe = true;
+        require(!forwardCallbackLock, "No reentrancy");
+        forwardCallbackLock = true;
 
         Lender storage storedLender = lenders[topLenders[0]];
         require(storedLender.lender != address(0), "No lender registered");
@@ -281,13 +285,13 @@ contract Registry is Owned {
             abi.encode(data, callbackReceiver, callback),
             this.forwardCallback(address, ERC20, uint256, uint256, bytes) // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
         );
-        delete safe;
+        delete forwardCallbackLock;
         return result;
     }
 
     /// @dev Forward the callback to the callback receiver, acting as a trusted forwarder.
     function forwardCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory outerData) external returns (bytes memory) {
-        require(safe, "Unauthorized callback");
+        require(forwardCallbackLock, "Unauthorized callback");
         (
             bytes memory innerData,
             address callbackReceiver,
