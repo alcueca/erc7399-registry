@@ -24,6 +24,14 @@ interface IERC3156PPLender is Owned {
     ) external returns (bytes memory);
 }
 
+library Cast {
+
+    /// @dev Cast a uint256 to a uint88, reverting on overflow
+    function u88(uint256 x) internal pure returns (uint88 y) {
+        require((y = uint88(x)) == x);
+    }
+}
+
 /// @dev The forwarder is deployed by the registry to verify that the loan can be sent to a contract
 /// different from the one that receives the callback
 contract Forwarder {
@@ -43,14 +51,13 @@ contract Registry is Owned {
     event Unrequested(IERC3156PPLender lender, ERC20 asset);
     event Registered(IERC3156PPLender lender, ERC20 asset, uint256 rank);
     event Unregistered(IERC3156PPLender lender, ERC20 asset);
-    
+
     struct Lender {
-        // TODO: Pack to save gas on registration
         IERC3156PPLender lender; // The address of the lender
         ERC20 asset;             // The address of the asset
-        uint256 amount;          // The amount of the asset lent on registration, in asset units and capped at 2**88-1
-        uint256 fee;             // The fee paid to the lender on registration, in percentage of the loan amount
-        uint256 gas;             // The gas used on registration
+        uint88 amount;           // The amount of the asset lent on registration, in asset units and capped at 2**88-1
+        uint88 fee;              // The fee paid to the lender on registration, in percentage of the loan amount
+        uint88 gas;              // The gas used on registration
     }
 
     Forwarder public immutable forwarder; // The forwarder contract
@@ -68,7 +75,7 @@ contract Registry is Owned {
             Lender(
                 IERC3156PPLender(address(0)),
                 ERC20(address(0)),
-                type(uint256).max,
+                type(uint88).max,
                 0,
                 0
             )
@@ -138,9 +145,9 @@ contract Registry is Owned {
         Lender memory newLender = Lender(
             lender,
             asset,
-            amount,
-            fee * 1e18 / amount,
-            gasAtCall - gasAtCallback
+            (amount / (10 ** asset.decimals())).u88(),
+            (fee * 1e18 / amount).u88(),
+            (gasAtCall - gasAtCallback).u88()
         );
 
         // If this is the first time the lender is registered for the given asset, add it to the list of lenders
