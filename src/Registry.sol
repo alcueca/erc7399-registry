@@ -39,6 +39,11 @@ contract Forwarder {
 }
 
 contract Registry is Owned {
+    event Requested(IERC3156PPLender lender, ERC20 asset);
+    event Unrequested(IERC3156PPLender lender, ERC20 asset);
+    event Registered(IERC3156PPLender lender, ERC20 asset, uint256 rank);
+    event Unregistered(IERC3156PPLender lender, ERC20 asset);
+    
     struct Lender {
         // TODO: Pack to save gas on registration
         IERC3156PPLender lender; // The address of the lender
@@ -74,6 +79,24 @@ contract Registry is Owned {
     /// ------------------------------------------------------- REGISTRY ------------------------------------------------------- ///
     /// ------------------------------------------------------------------------------------------------------------------------ ///
 
+    /// @dev Anyone can request a lender to be registered for a given asset. There is a delay of 7 days.
+    function request(IERC3156PPLender lender, ERC20 asset) external {
+        bytes32 requestHash = keccak256(abi.encode(lender,asset));
+        require(requests[requestHash] == 0, "Request already made");
+        requests[requestHash] = block.timestamp + 7 days;
+
+        emit Requested(lender, asset);
+    }
+
+    /// @dev Governance can remove a request if found to be malicious.
+    function unrequest(IERC3156PPLender lender, ERC20 asset) external onlyOwner {
+        bytes32 requestHash = keccak256(abi.encode(lender,asset));
+        require(requests[requestHash] > 0, "Request not made");
+        delete requests[requestHash];
+
+        emit Unrequested(lender, asset);
+    }
+
     /// @dev Register an ERC3156++ flash loan lender for a given asset.
     /// The registry process will involve a flash loan of the asset of the amount specified by the user.
     /// If the assets are made available to this contract, and the caller pays for the fee, the lender will be registered.
@@ -82,7 +105,11 @@ contract Registry is Owned {
     /// @param lender The address of the lender to be registered.
     /// @param asset The address of the asset to be registered.
     /// @param amount The amount of the asset to be registered.
-    function register(IERC3156PPLender lender, ERC20 asset, uint256 amount) onlyOwner external returns (uint256) {
+    function register(IERC3156PPLender lender, ERC20 asset, uint256 amount) external returns (uint256) {
+        bytes32 requestHash = keccak256(abi.encode(lender,asset));
+        require(requests[requestHash] > block.timestamp, "Request not ready");
+        delete requests[requestHash];
+
         safe = true;
         uint256 rank = abi.decode(uint256, lender.flashLoan(
             forwarder,
@@ -93,6 +120,8 @@ contract Registry is Owned {
             this.registerCallback(address, ERC20, uint256, uint256, bytes)
         ));
         delete safe;
+
+        emit Registered(lender, asset, rank);
         return rank;
     }
 
@@ -153,6 +182,8 @@ contract Registry is Owned {
             topLenders_[2] = 0;
         }
         topLenders[asset] = topLenders_;
+
+        emit Unregistered(lender, asset);
     }
 
     /// @dev Return the rank of the lender for the given asset, and update the top lenders if needed.
