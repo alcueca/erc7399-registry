@@ -8,9 +8,9 @@ interface IERC3156PP {
 
     /**
      * @dev Initiate a flash loan.
-     * @param loanReceiver The receiver of the tokens in the loan
+     * @param loanReceiver The receiver of the assets in the loan
      * @param asset The loan currency.
-     * @param amount The amount of tokens lent.
+     * @param amount The amount of assets lent.
      * @param data Arbitrary data structure, intended to contain user-defined parameters.
      * @param callback The function to call on the callback receiver.
      * @return The returned data by the receiver of the flash loan.
@@ -32,23 +32,38 @@ interface IERC3156PP {
 
     /**
      * @dev The amount of currency available to be lended.
-     * @param token The loan currency.
-     * @return The amount of `token` that can be borrowed.
+     * @param asset The loan currency.
+     * @return The amount of `asset` that can be borrowed.
      */
-    function maxFlashLoan(ERC20 token) external view returns (uint256);
+    function maxFlashLoan(ERC20 asset) external view returns (uint256);
 
     /**
      * @dev The fee to be charged for a given loan.
-     * @param token The loan currency.
-     * @param amount The amount of tokens lent.
-     * @return The amount of `token` to be charged for the loan, on top of the returned principal.
+     * @param asset The loan currency.
+     * @param amount The amount of assets lent.
+     * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
      */
-    function flashFee(ERC20 token, uint256 amount) external view returns (uint256);
+    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256);
 }
 
 interface Chooser {
     /// @dev Return the lender that can best service the loan.
     function choose(ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best);
+
+    /**
+     * @dev The amount of currency available to be lended.
+     * @param asset The loan currency.
+     * @return The amount of `asset` that can be borrowed.
+     */
+    function maxFlashLoan(ERC20 asset) external view returns (uint256);
+
+    /**
+     * @dev The fee to be charged for a given loan.
+     * @param asset The loan currency.
+     * @param amount The amount of assets lent.
+     * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256);
 }
 
 contract CheapestOfThreeChooser is Chooser, Owned {
@@ -66,7 +81,7 @@ contract CheapestOfThreeChooser is Chooser, Owned {
 
     /// @dev Return the lender that can service the loan for the lowest fee.
     /// @notice If no suitable lender is found, returns address(0).
-    function choose(ERC20 asset, uint256 amount, bytes memory) external view returns (IERC3156PP) {
+    function _choose(ERC20 asset, uint256 amount) internal view returns (IERC3156PP) {
         IERC3156PP[3] memory lenders = lenderSets[msg.sender][asset];
         
         uint256 cheapestCost = type(uint256).max;
@@ -82,6 +97,40 @@ contract CheapestOfThreeChooser is Chooser, Owned {
             }
         }
         return bestLender;
+    }
+
+    /// @dev Return the lender that can service the loan for the lowest fee.
+    /// @notice If no suitable lender is found, returns address(0).
+    function choose(ERC20 asset, uint256 amount, bytes memory) external view returns (IERC3156PP) {
+        return _choose(asset, amount);
+    }
+
+    /**
+     * @dev The amount of currency available to be lended.
+     * @param asset The loan currency.
+     * @return The amount of `asset` that can be borrowed.
+     */
+    function maxFlashLoan(ERC20 asset) external view returns (uint256) {
+        IERC3156PP[3] memory lenders = lenderSets[msg.sender][asset];
+        
+        uint256 largestSize = 0;
+        for (uint256 i = 0; i < 3; i++) {
+            if (address(lenders[i]) == address(0)) return largestSize;
+            uint256 size = lenders[i].maxFlashLoan(asset);
+            if (size == type(uint256).max) return size;
+            if (size > largestSize) largestSize = size;
+        }
+        return largestSize;
+    }
+
+    /**
+     * @dev The fee to be charged for a given loan.
+     * @param asset The loan currency.
+     * @param amount The amount of assets lent.
+     * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256) {
+        return _choose(asset, amount).flashFee(asset, amount);
     }
 }
 
@@ -103,7 +152,7 @@ library RevertMsgExtractor {
     }
 }
 
-contract FlashLenderAggregator is CheapestOfThreeChooser {
+contract FlashLenderAggregator {
     using RevertMsgExtractor for bytes;
 
     event ChooserSet(address indexed user, ERC20 indexed asset, Chooser chooser);
@@ -112,8 +161,11 @@ contract FlashLenderAggregator is CheapestOfThreeChooser {
     bool public inFlashLoan;
 
     mapping(address user => mapping(ERC20 asset => Chooser)) public choosers;
+    Chooser public immutable defaultChooser;
 
-    constructor (address owner) CheapestOfThreeChooser(owner) {}
+    constructor (address owner) {
+        defaultChooser = Chooser(address(new CheapestOfThreeChooser(owner)));
+    }
 
     /// @dev Set a chooser for the given asset.
     function setChooser(ERC20 asset, Chooser chooser) external {
@@ -141,7 +193,7 @@ contract FlashLenderAggregator is CheapestOfThreeChooser {
 
         // If the user has not registered a chooser for this asset, use the default chooser.
         Chooser chooser = choosers[msg.sender][asset];
-        if (address(chooser) == address(0)) chooser = Chooser(address(this));
+        if (address(chooser) == address(0)) chooser = defaultChooser;
 
         IERC3156PP lender;
         lender = chooser.choose(asset, amount, data);
@@ -151,7 +203,7 @@ contract FlashLenderAggregator is CheapestOfThreeChooser {
             loanReceiver,
             asset,
             amount,
-            abi.encode(data, callback.address, callback.selector), // abi.decode seems to struggle with function types
+            abi.encode(data, callback.address, callback.selector), // abi.decode seems to struggle with function types - https://github.com/ethereum/solidity/issues/6942
             this.forwardCallback // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
         );
         inFlashLoan = false;
@@ -176,5 +228,28 @@ contract FlashLenderAggregator is CheapestOfThreeChooser {
 
         emit FlashLoan(asset, amount, fee);
         return result;
+    }
+
+    /**
+     * @dev The amount of currency available to be lended.
+     * @param asset The loan currency.
+     * @return The amount of `asset` that can be borrowed.
+     */
+    function maxFlashLoan(ERC20 asset) external view returns (uint256) {
+        Chooser chooser = choosers[msg.sender][asset];
+        if (address(chooser) == address(0)) chooser = Chooser(address(this));
+        return chooser.maxFlashLoan(asset);
+    }
+
+    /**
+     * @dev The fee to be charged for a given loan.
+     * @param asset The loan currency.
+     * @param amount The amount of assets lent.
+     * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256) {
+        Chooser chooser = choosers[msg.sender][asset];
+        if (address(chooser) == address(0)) chooser = Chooser(address(this));
+        return chooser.flashFee(asset, amount);
     }
 }
