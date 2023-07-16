@@ -2,6 +2,7 @@
 pragma solidity >=0.8.19;
 
 import { ERC20 } from "lib/solmate/src/tokens/ERC20.sol";
+import { Owned } from "lib/solmate/src/auth/Owned.sol";
 
 interface IERC3156PP {
 
@@ -46,8 +47,42 @@ interface IERC3156PP {
 }
 
 interface Chooser {
-    /// @dev Return the best of the lender for the given asset and amount.
-    function choose(IERC3156PP[3] calldata, ERC20 asset, uint256 amount, bytes memory data) external returns (IERC3156PP);
+    /// @dev Return the lender that can best service the loan.
+    function choose(ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best);
+}
+
+contract CheapestOfThreeChooser is Chooser, Owned {
+    event Set(address indexed user, ERC20 indexed asset, IERC3156PP[3] lenders);
+
+    mapping(address user => mapping(ERC20 asset => IERC3156PP[3])) public lenderSets;
+
+    constructor (address owner) Owned(owner) {}
+
+    /// @dev Set three lenders for the given asset, and an algorithm to choose between them.
+    function set(ERC20 asset, IERC3156PP[3] memory lenders) onlyOwner external {
+        lenderSets[msg.sender][asset] = lenders;
+        emit Set(msg.sender, asset, lenders);
+    }
+
+    /// @dev Return the lender that can service the loan for the lowest fee.
+    /// @notice If no suitable lender is found, returns address(0).
+    function choose(ERC20 asset, uint256 amount, bytes memory) external view returns (IERC3156PP) {
+        IERC3156PP[3] memory lenders = lenderSets[msg.sender][asset];
+        
+        uint256 cheapestCost = type(uint256).max;
+        IERC3156PP bestLender;
+        for (uint256 i = 0; i < 3; i++) {
+            if (address(lenders[i]) == address(0)) return lenders[i];
+            if (lenders[i].maxFlashLoan(asset) < amount) continue;
+            uint256 cost = lenders[i].flashFee(asset, amount);
+            if (cost == 0) return lenders[i];
+            if (cost < cheapestCost) {
+                cheapestCost = cost;
+                bestLender = lenders[i];
+            }
+        }
+        return bestLender;
+    }
 }
 
 library RevertMsgExtractor {
@@ -68,48 +103,22 @@ library RevertMsgExtractor {
     }
 }
 
-contract Registry is Chooser {
+contract FlashLenderAggregator is CheapestOfThreeChooser {
     using RevertMsgExtractor for bytes;
 
+    event ChooserSet(address indexed user, ERC20 indexed asset, Chooser chooser);
     event FlashLoan(ERC20 indexed asset, uint256 amount, uint256 fee);
-    event Set(address indexed user, ERC20 indexed asset, IERC3156PP[3] lenders, Chooser chooser);
-
-    struct LenderSet {
-        IERC3156PP[3] lenders;
-        Chooser chooser;
-        bool exists;
-    }
 
     bool public inFlashLoan;
 
-    mapping(address user => mapping(ERC20 asset => LenderSet)) public lenderSets;
-    mapping(ERC20 asset => IERC3156PP) public lastLenders;
+    mapping(address user => mapping(ERC20 asset => Chooser)) public choosers;
 
-    /// @dev Set three lenders for the given asset, and an algorithm to choose between them.
-    function set(ERC20 asset, IERC3156PP[3] memory lenders_, Chooser chooser_) external {
-        lenderSets[msg.sender][asset] = LenderSet(lenders_, chooser_, true);
+    constructor (address owner) CheapestOfThreeChooser(owner) {}
 
-        emit Set(msg.sender, asset, lenders_, chooser_);
-    }
-
-    /// @dev Return the lender that can service the loan for the lowest fee.
-    /// This is a default Chooser, but users can implement their own.
-    function choose(IERC3156PP[3] calldata lenders, ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best) {
-        return _choose(lenders, asset, amount, data);
-    }
-
-    /// @dev Return the lender that can service the loan for the lowest fee.
-    function _choose(IERC3156PP[3] calldata lenders, ERC20 asset, uint256 amount, bytes memory) internal view returns (IERC3156PP best) {
-        uint256 cheapest = type(uint256).max;
-        for (uint256 i = 0; i < 3; i++) {
-            if (lenders[i] != IERC3156PP(address(0)) && lenders[i].maxFlashLoan(asset) >= amount) {
-                uint256 cost = lenders[i].flashFee(asset, amount);
-                if (cost < cheapest) {
-                    cost = cheapest;
-                    best = lenders[i];
-                }
-            }
-        }
+    /// @dev Set a chooser for the given asset.
+    function setChooser(ERC20 asset, Chooser chooser) external {
+        choosers[msg.sender][asset] = chooser;
+        emit ChooserSet(msg.sender, asset, chooser);
     }
 
     /// @dev Use the set lender to serve an ERC3156++ flash loan.
@@ -130,16 +139,12 @@ contract Registry is Chooser {
         require(!inFlashLoan, "No reentrancy");
         inFlashLoan = true;
 
-        LenderSet storage lenderSet = lenderSets[msg.sender][asset];
-        IERC3156PP lender;
-        // If the user has registered a lender set for the asset, try to choose one.
-        if (lenderSet.exists) {
-            lender = lenderSet.chooser.choose(lenderSet.lenders, asset, amount, data);
-            if (lender != IERC3156PP(address(0))) lastLenders[asset] = lender;
-        }
-        // If not possible, use the last lender for that asset from other users.
-        else lender = lastLenders[asset];
+        // If the user has not registered a chooser for this asset, use the default chooser.
+        Chooser chooser = choosers[msg.sender][asset];
+        if (address(chooser) == address(0)) chooser = Chooser(address(this));
 
+        IERC3156PP lender;
+        lender = chooser.choose(asset, amount, data);
         require (lender != IERC3156PP(address(0)), "No lender found");
 
         bytes memory result = lender.flashLoan(
@@ -156,9 +161,8 @@ contract Registry is Chooser {
     /// @dev Forward the callback to the callback receiver, acting as a trusted forwarder.
     function forwardCallback(address loanReceiver, ERC20 asset, uint256 amount, uint256 fee, bytes memory outerData) external returns (bytes memory) {
         require(inFlashLoan, "Unauthorized callback");
-        (bytes memory innerData, address callbackReceiver, bytes4 callbackSelector) = abi.decode(outerData, (bytes, address, bytes4));
 
-        emit FlashLoan(asset, amount, fee);
+        (bytes memory innerData, address callbackReceiver, bytes4 callbackSelector) = abi.decode(outerData, (bytes, address, bytes4));
         (bool success, bytes memory result) = callbackReceiver.call(
             abi.encodeWithSelector(
                 callbackSelector,
@@ -168,9 +172,9 @@ contract Registry is Chooser {
                 innerData
             )
         );
-
         require(success, result.getRevertMsg());
 
+        emit FlashLoan(asset, amount, fee);
         return result;
     }
 }
