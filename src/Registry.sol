@@ -8,7 +8,6 @@ interface IERC3156PP {
     /**
      * @dev Initiate a flash loan.
      * @param loanReceiver The receiver of the tokens in the loan
-     * @param callbackReceiver The receiver of the callback.
      * @param asset The loan currency.
      * @param amount The amount of tokens lent.
      * @param data Arbitrary data structure, intended to contain user-defined parameters.
@@ -17,7 +16,6 @@ interface IERC3156PP {
      */
     function flashLoan(
         address loanReceiver,
-        address callbackReceiver,
         ERC20 asset,
         uint256 amount,
         bytes calldata data,
@@ -117,7 +115,6 @@ contract Registry is Chooser {
     /// @dev Use the set lender to serve an ERC3156++ flash loan.
     function flashLoan(
         address loanReceiver,
-        address callbackReceiver,
         ERC20 asset,
         uint256 amount,
         bytes calldata data,
@@ -147,10 +144,9 @@ contract Registry is Chooser {
 
         bytes memory result = lender.flashLoan(
             loanReceiver,
-            address(this),
             asset,
             amount,
-            abi.encode(data, callbackReceiver, callback.selector),
+            abi.encode(data, callback.address, callback.selector), // abi.decode seems to struggle with function types
             this.forwardCallback // In many cases, for the callback receiver to trust the flash loan, the callback must come from a known contract. The aggregator contract can be used as a trusted forwarder.
         );
         inFlashLoan = false;
@@ -166,7 +162,6 @@ contract Registry is Chooser {
         (bool success, bytes memory result) = callbackReceiver.call(
             abi.encodeWithSelector(
                 callbackSelector,
-                msg.sender,
                 loanReceiver,
                 asset,
                 amount,
