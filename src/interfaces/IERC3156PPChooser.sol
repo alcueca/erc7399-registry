@@ -6,14 +6,14 @@ import { IERC3156PP } from "./IERC3156PP.sol";
 
 interface IERC3156PPChooser {
     /// @dev Return the lender that can best service the loan.
-    function choose(ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best);
+    function choose(address user, ERC20 asset, uint256 amount, bytes memory data) external view returns (IERC3156PP best);
 
     /**
      * @dev The amount of currency available to be lended.
      * @param asset The loan currency.
      * @return The amount of `asset` that can be borrowed.
      */
-    function maxFlashLoan(ERC20 asset) external view returns (uint256);
+    function maxFlashLoan(address user, ERC20 asset) external view returns (IERC3156PP, uint256);
 
     /**
      * @dev The fee to be charged for a given loan.
@@ -21,5 +21,5 @@ interface IERC3156PPChooser {
      * @param amount The amount of assets lent.
      * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
      */
-    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256);
+    function flashFee(address user, ERC20 asset, uint256 amount) external view returns (IERC3156PP, uint256);
 }

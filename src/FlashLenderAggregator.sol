@@ -60,7 +60,7 @@ contract FlashLenderAggregator {
         if (address(chooser) == address(0)) chooser = defaultChooser;
 
         IERC3156PP lender;
-        lender = chooser.choose(asset, amount, data);
+        lender = chooser.choose(msg.sender, asset, amount, data);
         require (lender != IERC3156PP(address(0)), "No lender found");
 
         bytes memory result = lender.flashLoan(
@@ -103,23 +103,23 @@ contract FlashLenderAggregator {
     /**
      * @dev The amount of currency available to be lended.
      * @param asset The loan currency.
-     * @return The amount of `asset` that can be borrowed.
+     * @return max The amount of `asset` that can be borrowed.
      */
-    function maxFlashLoan(ERC20 asset) external view returns (uint256) {
+    function maxFlashLoan(ERC20 asset) external view returns (uint256 max) {
         IERC3156PPChooser chooser = choosers[msg.sender][asset];
         if (address(chooser) == address(0)) chooser = IERC3156PPChooser(address(this));
-        return chooser.maxFlashLoan(asset);
+        (, max) = chooser.maxFlashLoan(msg.sender, asset);
     }
 
     /**
      * @dev The fee to be charged for a given loan.
      * @param asset The loan currency.
      * @param amount The amount of assets lent.
-     * @return The amount of `asset` to be charged for the loan, on top of the returned principal.
+     * @return fee The amount of `asset` to be charged for the loan, on top of the returned principal.
      */
-    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256) {
+    function flashFee(ERC20 asset, uint256 amount) external view returns (uint256 fee) {
         IERC3156PPChooser chooser = choosers[msg.sender][asset];
         if (address(chooser) == address(0)) chooser = IERC3156PPChooser(address(this));
-        return chooser.flashFee(asset, amount);
+        (, fee) = chooser.flashFee(msg.sender, asset, amount);
     }
 }
